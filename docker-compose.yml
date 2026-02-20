@@ -1,0 +1,328 @@
+version: "3.8"
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  platform: linux/amd64  
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow:5432@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # MinIO/S3 Configuração
+    AIRFLOW__AWS__S3_ENDPOINT: http://minio:9000
+    AIRFLOW__AWS__S3_ACCESS_KEY_ID: minioadmin
+    AIRFLOW__AWS__S3_SECRET_ACCESS_KEY: minioadmin
+    # Spark Config
+    SPARK_HOME: /opt/spark
+    PYTHONPATH: /opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip
+    PYSPARK_PYTHON: /usr/local/bin/python
+    PYSPARK_DRIVER_PYTHON: /usr/local/bin/python
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+    PATH: /usr/lib/jvm/java-17-openjdk-amd64/bin:/opt/spark/bin:/opt/spark/sbin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+    - spark-deps:/opt/spark
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  # ===========================================
+  # Bancos de Dados e Message Broker
+  # ===========================================
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  # ===========================================
+  # MinIO - Storage S3-Compatible
+  # ===========================================
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: always
+
+  # Criação automática de buckets no MinIO
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/delta-lake || true;
+      /usr/bin/mc mb myminio/airflow-logs || true;
+      /usr/bin/mc mb myminio/spark-warehouse || true;
+      /usr/bin/mc policy set public myminio/delta-lake;
+      exit 0;
+      "
+
+  # ===========================================
+  # Spark Services - Apache Official 3.5.6
+  # ===========================================
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+      args:
+        SPARK_VERSION: 3.5.6
+        DELTA_VERSION: 3.3.0
+    image: custom-spark:3.5.6-delta
+    container_name: spark-master
+    hostname: spark-master
+    command: >
+      bash -c "
+        echo 'Starting Spark Master...' &&
+        /opt/spark/sbin/start-master.sh --host spark-master --port 7077 --webui-port 8080 &&
+        tail -f /opt/spark/logs/spark--org.apache.spark.deploy.master.Master-1-*.out
+      "
+    ports:
+      - "9090:8080"    # Spark Master UI (evita conflito com Airflow)
+      - "7077:7077"    # Spark Master Port
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_MASTER_LOG=/opt/spark/logs
+      - SPARK_MASTER_BIND_ADDRESS=0.0.0.0
+      # Configurações Delta e S3A
+      - SPARK_EXTRA_CLASSPATH=/opt/spark/jars/*
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - spark-jars:/opt/spark/jars
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+      - spark-logs:/opt/spark/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+      args:
+        SPARK_VERSION: 3.5.6
+        DELTA_VERSION: 3.3.0
+    image: custom-spark:3.5.6-delta
+    container_name: spark-worker
+    hostname: spark-worker
+    command: >
+      bash -c "
+        echo 'Waiting for Spark Master...' &&
+        sleep 10 &&
+        echo 'Starting Spark Worker...' &&
+        /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --webui-port 8081 &&
+        tail -f /opt/spark/logs/spark--org.apache.spark.deploy.worker.Worker-1-*.out
+      "
+    depends_on:
+      - spark-master
+    ports:
+      - "9091:8081"    # Spark Worker UI (evita conflito)
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_PORT=8881    # Alterado de 8888 para 8881
+      - SPARK_WORKER_WEBUI_PORT=8081
+      - SPARK_MASTER=spark://spark-master:7077
+      # Configurações Delta e S3A
+      - SPARK_EXTRA_CLASSPATH=/opt/spark/jars/*
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - spark-jars:/opt/spark/jars
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+      - spark-logs:/opt/spark/logs
+    restart: always
+
+  # ===========================================
+  # Airflow Services
+  # ===========================================
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8085:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ===========================================
+  # Airflow Init - Corrigido para inicialização correta
+  # ===========================================
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      >
+      bash -c "
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
+        chown -R ${AIRFLOW_UID}:0 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
+        airflow db migrate &&
+        airflow users create --username ${_AIRFLOW_WWW_USER_USERNAME:-airflow}  --firstname Admin --lastname User --role Admin --email admin@example.com  --password ${_AIRFLOW_WWW_USER_PASSWORD:-airflow} || echo "Usuário já existe ou erro na criação"
+      "
+     
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+  # ===========================================
+  # Flower - Monitoramento Celery
+  # ===========================================
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
+  minio-data:
+  spark-jars:
+  spark-deps:
+  spark-logs:

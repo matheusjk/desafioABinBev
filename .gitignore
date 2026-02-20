@@ -1,0 +1,263 @@
+# =============================================================================
+# AIRFLOW - ARQUIVOS GERADOS E SENSÍVEIS
+# =============================================================================
+
+# Logs do Airflow
+logs/
+airflow/logs/
+*.log
+airflow-scheduler.log
+airflow-webserver.log
+
+# Arquivos de PID (process ID)
+*.pid
+airflow-webserver.pid
+airflow-scheduler.pid
+
+# Banco de dados SQLite (não usar em produção!)
+airflow.db
+*.db
+
+# Arquivos de configuração local (podem conter senhas)
+airflow.cfg
+airflow_local_settings.py
+unittests.cfg
+
+# Secrets e credenciais (NEVER commit!)
+secrets/
+.env
+.env.local
+.env.*.local
+secrets.yaml
+secrets.json
+credentials/
+*.pem
+*.key
+*.crt
+id_rsa
+id_rsa.pub
+.ssh/
+
+# Conexões e variáveis exportadas do Airflow
+connections.json
+variables.json
+
+
+# =============================================================================
+# PYTHON - CACHE E AMBIENTES VIRTUAIS
+# =============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Ambientes virtuais
+venv/
+env/
+ENV/
+.venv/
+.env/
+virtualenv/
+pip-selfcheck.json
+
+# Distribuição / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testes
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+
+# =============================================================================
+# DOCKER - VOLUMES E BUILD
+# =============================================================================
+
+# Volumes de dados do Docker
+data/
+postgres_data/
+minio_data/
+redis_data/
+elasticsearch_data/
+mysql_data/
+
+# Arquivos de build do Docker
+.dockerignore
+Dockerfile.*
+docker-compose.*.yml
+!docker-compose.yml
+!docker-compose.yaml
+
+# Imagens e layers
+*.tar
+*.img
+
+
+# =============================================================================
+# MINIO / S3 - DADOS LOCAIS
+# =============================================================================
+
+# Dados do MinIO
+minio/
+.minio.sys/
+buckets/
+*.minio
+
+# Arquivos de dados brutos (exemplos grandes)
+data/raw/
+data/processed/
+data/temp/
+*.csv
+*.parquet
+*.json
+*.xlsx
+*.xls
+*.zip
+*.gz
+*.tar.gz
+
+
+# =============================================================================
+# IDE E EDITORES
+# =============================================================================
+
+# VS Code
+.vscode/
+*.code-workspace
+.history/
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.iws
+out/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+.\#*
+\#*\#
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+
+# =============================================================================
+# SISTEMA E TEMPORÁRIOS
+# =============================================================================
+
+# Arquivos temporários
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+*.swp
+*~
+
+# Arquivos de lock
+*.lock
+pip-wheel-metadata/
+poetry.lock
+Pipfile.lock
+
+# Outros
+*.log.*
+*.pid
+*.seed
+*.pid.lock
+.node_repl_history
+.yarn-integrity
+
+
+# =============================================================================
+# PROJETO ESPECÍFICO - AJUSTE CONFORME NECESSÁRIO
+# =============================================================================
+
+# DAGs de teste/exemplo que não devem ir para produção
+dags/test_*.py
+dags/example_*.py
+dags/tutorial_*.py
+!dags/.gitkeep
+
+# Scripts locais de desenvolvimento
+scripts/local/
+scripts/dev_*.sh
+scripts/test_*.py
+
+# Documentação gerada
+docs/_build/
+site/
+
+# Arquivos de análise/BI
+*.pbix
+*.twb
+*.twbx
+
+# Terraform (se usar)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
