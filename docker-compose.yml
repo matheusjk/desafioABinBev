@@ -1,328 +1,396 @@
 version: "3.8"
 
-x-airflow-common:
-  &airflow-common
-  build:
-    context: .
-    dockerfile: Dockerfile.airflow
-  platform: linux/amd64  
-  environment:
-    &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow:5432@postgres/airflow
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
-    AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
-    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    # MinIO/S3 Configuração
-    AIRFLOW__AWS__S3_ENDPOINT: http://minio:9000
-    AIRFLOW__AWS__S3_ACCESS_KEY_ID: minioadmin
-    AIRFLOW__AWS__S3_SECRET_ACCESS_KEY: minioadmin
-    # Spark Config
-    SPARK_HOME: /opt/spark
-    PYTHONPATH: /opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip
-    PYSPARK_PYTHON: /usr/local/bin/python
-    PYSPARK_DRIVER_PYTHON: /usr/local/bin/python
-    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
-    PATH: /usr/lib/jvm/java-17-openjdk-amd64/bin:/opt/spark/bin:/opt/spark/sbin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-  volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
-    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
-    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
-    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
-    - spark-deps:/opt/spark
-  user: "${AIRFLOW_UID:-50000}:0"
-  depends_on:
-    &airflow-common-depends-on
-    redis:
-      condition: service_healthy
-    postgres:
-      condition: service_healthy
-
 services:
-  # ===========================================
-  # Bancos de Dados e Message Broker
-  # ===========================================
+  # PostgreSQL com pgvector
   postgres:
-    image: postgres:15-alpine
+    image: ankane/pgvector:latest
+    container_name: postgres-pgvector
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: metabase_db
     volumes:
-      - postgres-db-volume:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - data-stack-network
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d metabase_db"]
       interval: 10s
+      timeout: 5s
       retries: 5
-      start_period: 5s
-    restart: always
 
-  redis:
-    image: redis:7-alpine
-    expose:
-      - 6379
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 30s
-      retries: 50
-      start_period: 30s
-    restart: always
+  # Metabase
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase_db
+      MB_DB_PORT: 5432
+      MB_DB_USER: admin
+      MB_DB_PASS: admin123
+      MB_DB_HOST: postgres
+      MB_ENCRYPTION_SECRET_KEY: minha_chave_secreta_32_chars!!
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-stack-network
 
-  # ===========================================
-  # MinIO - Storage S3-Compatible
-  # ===========================================
+  # MinIO (última versão)
   minio:
     image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
     ports:
       - "9000:9000"
       - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - minio-data:/data
-    command: server /data --console-address ":9001"
+    networks:
+      - data-stack-network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 3
-    restart: always
 
-  # Criação automática de buckets no MinIO
-  createbuckets:
+  # Criar bucket padrão no MinIO
+  minio-create-bucket:
     image: minio/mc:latest
+    container_name: minio-mc
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
-      /usr/bin/mc mb myminio/delta-lake || true;
-      /usr/bin/mc mb myminio/airflow-logs || true;
-      /usr/bin/mc mb myminio/spark-warehouse || true;
-      /usr/bin/mc policy set public myminio/delta-lake;
+      sleep 10;
+      /usr/bin/mc config host add myminio http://minio:9000 minioadmin minioadmin123;
+      /usr/bin/mc mb myminio/datalake || true;
+      /usr/bin/mc policy set public myminio/datalake;
       exit 0;
       "
+    networks:
+      - data-stack-network
 
-  # ===========================================
-  # Spark Services - Apache Official 3.5.6
-  # ===========================================
+
+
+
+  # ==========================================
+  # Apache Spark 3.5.7 (Oficial)
+  # ==========================================
   spark-master:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
-      args:
-        SPARK_VERSION: 3.5.6
-        DELTA_VERSION: 3.3.0
-    image: custom-spark:3.5.6-delta
+    image: apache/spark:3.5.8-scala2.12-java17-python3-r-ubuntu
     container_name: spark-master
     hostname: spark-master
+    user: root
     command: >
-      bash -c "
-        echo 'Starting Spark Master...' &&
-        /opt/spark/sbin/start-master.sh --host spark-master --port 7077 --webui-port 8080 &&
-        tail -f /opt/spark/logs/spark--org.apache.spark.deploy.master.Master-1-*.out
+      sh -c "
+      pip3 install requests pandas &&
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master 
+      --host spark-master 
+      --port 7077 
+      --webui-port 8080
       "
-    ports:
-      - "9090:8080"    # Spark Master UI (evita conflito com Airflow)
-      - "7077:7077"    # Spark Master Port
     environment:
       - SPARK_MODE=master
       - SPARK_MASTER_PORT=7077
       - SPARK_MASTER_WEBUI_PORT=8080
       - SPARK_MASTER_LOG=/opt/spark/logs
-      - SPARK_MASTER_BIND_ADDRESS=0.0.0.0
-      # Configurações Delta e S3A
-      - SPARK_EXTRA_CLASSPATH=/opt/spark/jars/*
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # MinIO/S3A configs
+      - SPARK_HADOOP_FS_S3A_ENDPOINT=http://minio:9000
+      - SPARK_HADOOP_FS_S3A_ACCESS_KEY=minioadmin
+      - SPARK_HADOOP_FS_S3A_SECRET_KEY=minioadmin
+      - SPARK_HADOOP_FS_S3A_PATH_STYLE_ACCESS=true
+      - SPARK_HADOOP_FS_S3A_IMPL=org.apache.hadoop.fs.s3a.S3AFileSystem
+      - SPARK_HADOOP_FS_S3A_CONNECTION_SSL_ENABLED=false
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "8888:8888"
     volumes:
-      - spark-jars:/opt/spark/jars
-      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
-      - spark-logs:/opt/spark/logs
+      - spark_data:/opt/spark/work
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./jars:/opt/spark/user-jars:ro
+      - ./dados_compartilhados:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
-      retries: 3
-    restart: always
+      retries: 10
+    networks:
+      - data-stack-network
 
-  spark-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
-      args:
-        SPARK_VERSION: 3.5.6
-        DELTA_VERSION: 3.3.0
-    image: custom-spark:3.5.6-delta
-    container_name: spark-worker
-    hostname: spark-worker
+  spark-worker-1:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-r-ubuntu
+    container_name: spark-worker-1
     command: >
-      bash -c "
-        echo 'Waiting for Spark Master...' &&
-        sleep 10 &&
-        echo 'Starting Spark Worker...' &&
-        /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --webui-port 8081 &&
-        tail -f /opt/spark/logs/spark--org.apache.spark.deploy.worker.Worker-1-*.out
-      "
-    depends_on:
-      - spark-master
-    ports:
-      - "9091:8081"    # Spark Worker UI (evita conflito)
+      /opt/spark/bin/spark-class 
+      org.apache.spark.deploy.worker.Worker 
+      spark://spark-master:7077 
+      --webui-port 8081
     environment:
       - SPARK_MODE=worker
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2G
-      - SPARK_WORKER_PORT=8881    # Alterado de 8888 para 8881
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_PORT=8881
       - SPARK_WORKER_WEBUI_PORT=8081
-      - SPARK_MASTER=spark://spark-master:7077
-      # Configurações Delta e S3A
-      - SPARK_EXTRA_CLASSPATH=/opt/spark/jars/*
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-    volumes:
-      - spark-jars:/opt/spark/jars
-      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
-      - spark-logs:/opt/spark/logs
-    restart: always
-
-  # ===========================================
-  # Airflow Services
-  # ===========================================
-  airflow-webserver:
-    <<: *airflow-common
-    command: webserver
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # MinIO/S3A configs
+      - SPARK_HADOOP_FS_S3A_ENDPOINT=http://minio:9000
+      - SPARK_HADOOP_FS_S3A_ACCESS_KEY=minioadmin
+      - SPARK_HADOOP_FS_S3A_SECRET_KEY=minioadmin123
+      - SPARK_HADOOP_FS_S3A_PATH_STYLE_ACCESS=true
+      - SPARK_HADOOP_FS_S3A_IMPL=org.apache.hadoop.fs.s3a.S3AFileSystem
+      - SPARK_HADOOP_FS_S3A_CONNECTION_SSL_ENABLED=false
+    depends_on:
+      spark-master:
+        condition: service_healthy
     ports:
-      - "8085:8080"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    restart: always
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
+      - "8081:8081"
+    volumes:
+      - spark_data:/opt/spark/work
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./jars:/opt/spark/user-jars:ro
+      - ./dados_compartilhados:/data
+    networks:
+      - data-stack-network
 
-  airflow-scheduler:
-    <<: *airflow-common
-    command: scheduler
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    restart: always
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  airflow-worker:
-    <<: *airflow-common
-    command: celery worker
-    healthcheck:
-      test:
-        - "CMD-SHELL"
-        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+  spark-worker-2:
+    image: apache/spark:3.5.8-scala2.12-java17-python3-ubuntu
+    container_name: spark-worker-2
+    command: >
+      /opt/spark/bin/spark-class 
+      org.apache.spark.deploy.worker.Worker 
+      spark://spark-master:7077 
+      --webui-port 8081
     environment:
-      <<: *airflow-common-env
-      DUMB_INIT_SETSID: "0"
-    restart: always
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_PORT=8884
+      - SPARK_WORKER_WEBUI_PORT=8084
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # MinIO/S3A configs
+      - SPARK_HADOOP_FS_S3A_ENDPOINT=http://minio:9000
+      - SPARK_HADOOP_FS_S3A_ACCESS_KEY=minioadmin
+      - SPARK_HADOOP_FS_S3A_SECRET_KEY=minioadmin123
+      - SPARK_HADOOP_FS_S3A_PATH_STYLE_ACCESS=true
+      - SPARK_HADOOP_FS_S3A_IMPL=org.apache.hadoop.fs.s3a.S3AFileSystem
+      - SPARK_HADOOP_FS_S3A_CONNECTION_SSL_ENABLED=false
     depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8084:8084"
+    volumes:
+      - spark_data:/opt/spark/work
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./jars:/opt/spark/user-jars:ro
+      - ./dados_compartilhados:/data
+    networks:
+      - data-stack-network
 
-  airflow-triggerer:
-    <<: *airflow-common
-    command: triggerer
+  # Jupyter Notebook / JupyterLab
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: jupyter-notebook
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=datalake123
+      - JUPYTER_PASSWORD=datalake123
+      - GRANT_SUDO=yes
+      - SPARK_HOME=/usr/local/spark
+      - SPARK_OPTS=--driver-java-options=-Xms1024M --driver-java-options=-Xmx4096M --driver-java-options=-Dlog4j.logLevel=info
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-avro_2.12:3.4.1,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.6.0,org.apache.hadoop:hadoop-common:3.3.6,io.delta:delta-spark_2.12:3.2.0,com.amazonaws:aws-java-sdk-bundle:1.12.262 pyspark-shell
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # Conexões com serviços
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin123
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_S3_ENDPOINT_URL=http://minio:9000
+      - AIRFLOW_WEBSERVER_HOST=airflow-webserver
+      - AIRFLOW_WEBSERVER_PORT=8080
+    ports:
+      - "8889:8889"  # JupyterLab
+      # - "4040-4045:4040-4045"  # Spark UI ports para jobs individuais
+    volumes:
+      - jupyter_data:/home/jovyan/work
+      
+    
+    depends_on:
+      - spark-master
+      - postgres
+      - minio
+    networks:
+      - data-stack-network
+    command: >
+      start-notebook.sh 
+      --NotebookApp.token=datalake123 
+      --NotebookApp.password=datalake123
+      --NotebookApp.allow_root=true
+      --NotebookApp.open_browser=false
+      --NotebookApp.ip=0.0.0.0
+      --NotebookApp.port=8889
+      --LabApp.default_url=/lab
+
+  # Airflow PostgreSQL
+  airflow-db:
+    image: postgres:15
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow123
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    networks:
+      - data-stack-network
     healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
-      interval: 30s
-      timeout: 10s
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
       retries: 5
-      start_period: 30s
-    restart: always
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
 
-  # ===========================================
-  # Airflow Init - Corrigido para inicialização correta
-  # ===========================================
+  # Airflow Redis (para Celery Executor)
+  airflow-redis:
+    image: redis:7-alpine
+    container_name: airflow-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - data-stack-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Airflow Webserver
+  airflow-webserver:
+    image: apache/airflow:2.8.0
+    container_name: airflow-webserver
+    command: webserver
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-db/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-db/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://airflow-redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=FB0o_zt5eBlZx5K5C8y1xK0p-w4rW9fZ3QqZ3QqZ3Qq=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=true
+      - _PIP_ADDITIONAL_REQUIREMENTS=apache-airflow-providers-apache-spark pyspark minio sqlalchemy psycopg2-binary
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./requirements.txt:/requirements.txt
+      - ./dados_compartilhados:/data
+    ports:
+      - "8082:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-redis:
+        condition: service_healthy
+    networks:
+      - data-stack-network
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    image: apache/airflow:2.8.0
+    container_name: airflow-scheduler
+    command: scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-db/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-db/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://airflow-redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=FB0o_zt5eBlZx5K5C8y1xK0p-w4rW9fZ3QqZ3QqZ3Qq=
+      - _PIP_ADDITIONAL_REQUIREMENTS=apache-airflow-providers-apache-spark pyspark minio sqlalchemy psycopg2-binary
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    depends_on:
+      - airflow-webserver
+    networks:
+      - data-stack-network
+
+  # Airflow Worker
+  airflow-worker:
+    image: apache/airflow:2.8.0
+    container_name: airflow-worker
+    command: celery worker
+    user: "0:0" 
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-db/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-db/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://airflow-redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=FB0o_zt5eBlZx5K5C8y1xK0p-w4rW9fZ3QqZ3QqZ3Qq=
+     
+      - AIRFLOW_UID=50000
+      - AIRFLOW_GID=0
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Add the airflow user to docker group or run as root
+    depends_on:
+      - airflow-webserver
+      - airflow-redis
+    networks:
+      - data-stack-network
+
+  # Airflow Init (para inicialização do banco)
   airflow-init:
-    <<: *airflow-common
+    image: apache/airflow:2.8.0
+    container_name: airflow-init
     entrypoint: /bin/bash
     command:
-      >
-      bash -c "
-        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
-        chown -R ${AIRFLOW_UID}:0 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
-        airflow db migrate &&
-        airflow users create --username ${_AIRFLOW_WWW_USER_USERNAME:-airflow}  --firstname Admin --lastname User --role Admin --email admin@example.com  --password ${_AIRFLOW_WWW_USER_PASSWORD:-airflow} || echo "Usuário já existe ou erro na criação"
-      "
-     
-    environment:
-      <<: *airflow-common-env
-      _AIRFLOW_DB_MIGRATE: 'true'
-      _AIRFLOW_WWW_USER_CREATE: 'true'
-      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
-      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
-      _PIP_ADDITIONAL_REQUIREMENTS: ''
-    user: "0:0"
-
-  airflow-cli:
-    <<: *airflow-common
-    profiles:
-      - debug
-    environment:
-      <<: *airflow-common-env
-      CONNECTION_CHECK_MAX_COUNT: "0"
-    command:
-      - bash
       - -c
-      - airflow
-
-  # ===========================================
-  # Flower - Monitoramento Celery
-  # ===========================================
-  flower:
-    <<: *airflow-common
-    command: celery flower
-    profiles:
-      - flower
-    ports:
-      - "5555:5555"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    restart: always
+      - |
+        airflow db init &&
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-db/airflow
     depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+    networks:
+      - data-stack-network
 
 volumes:
-  postgres-db-volume:
-  minio-data:
-  spark-jars:
-  spark-deps:
-  spark-logs:
+  postgres_data:
+  minio_data:
+  spark_data:
+  spark_warehouse:
+  airflow_db_data:
+  jupyter_data:
+  dados_compartilhados:
+
+networks:
+  data-stack-network:
+    driver: bridge
+    name: data-stack-network
